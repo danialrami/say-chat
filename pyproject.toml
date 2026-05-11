@@ -1,0 +1,21 @@
+[project]
+name = "say-chat"
+version = "0.1.0"
+description = "Voice chat pipeline: record → transcribe → LLM → speak"
+authors = [{ name = "Daniel Ramirez" }]
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+]
+
+[project.urls]
+Homepage = "https://github.com/danielramirez/say-chat"
+
+[project.scripts]
+voice-chat = "say_chat.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

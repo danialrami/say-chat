@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import signal
 import subprocess
@@ -30,17 +31,43 @@ def load_config() -> dict:
         ).rstrip("/"),
         "model": os.environ.get("LITELLM_MODEL", "chat"),
         "device_id": int(os.environ.get("TSCRIBE_DEVICE_ID", "17")),
-        "say_voice": os.environ.get("SAY_VOICE", None),
-        "say_rate": os.environ.get("SAY_RATE"),
+        "tts_server_url": os.environ.get(
+            "TTS_SERVER_URL", "http://100.125.210.60:8001/v1/audio/speech"
+        ),
+        "tts_model": os.environ.get("TTS_MODEL", "qwen3-tts-voice-clone"),
+        "tts_voice": os.environ.get("TTS_VOICE", "danial"),
+        "tts_instructions": os.environ.get("TTS_INSTRUCTIONS", ""),
         "max_retries": int(os.environ.get("MAX_RETRIES", "3")),
         "backoff_factor": float(os.environ.get("BACKOFF_FACTOR", "1.0")),
     }
 
 
+def get_model_config(model_name: str) -> dict:
+    if model_name == "custom-voice":
+        return {
+            "model_name": "qwen3-tts-custom-voice",
+            "voice": "Ryan",
+            "instructions": "Speak cheerfully",
+        }
+    elif model_name == "voice-design":
+        return {
+            "model_name": "qwen3-tts-voice-design",
+            "voice": "A warm, friendly male voice with a British accent",
+            "instructions": "",
+        }
+    elif model_name == "voice-clone":
+        return {
+            "model_name": "qwen3-tts-voice-clone",
+            "voice": "danial",
+            "instructions": "",
+        }
+    else:
+        raise ValueError(f"Unknown model: {model_name}")
+
+
 # ── Recorder (tscribe subprocess) ─────────────────────────────────────
 
 def extract_transcript(output: str) -> str:
-    """Strip markdown wrapper from tscribe record stdout."""
     lines = output.splitlines()
     for i, line in enumerate(lines):
         if line.strip() == "---":
@@ -49,7 +76,6 @@ def extract_transcript(output: str) -> str:
 
 
 def record_audio(device_id: int) -> str | None:
-    """Record and transcribe via tscribe. Returns transcript text or None."""
     cmd = ["tscribe", "record", "--device-id", str(device_id)]
     process = subprocess.Popen(
         cmd,
@@ -167,16 +193,89 @@ class ChatClient:
         raise RuntimeError("Max retries exceeded")
 
 
-# ── Speaker ───────────────────────────────────────────────────────────
+# ── Streaming TTS Speaker ─────────────────────────────────────────────
 
-def speak(text: str, voice: str | None = None, rate: str | None = None):
-    cmd = ["say"]
-    if voice:
-        cmd.extend(["-v", voice])
-    if rate:
-        cmd.extend(["-r", str(rate)])
-    cmd.append(text)
-    subprocess.run(cmd, check=True, stderr=subprocess.DEVNULL)
+def speak_streaming(
+    text: str,
+    server_url: str,
+    model_name: str,
+    voice: str,
+    instructions: str,
+    response_format: str = "wav",
+):
+    payload = {
+        "model": model_name,
+        "input": text,
+        "voice": voice,
+        "response_format": response_format,
+        "stream": True,
+    }
+    if instructions:
+        payload["instructions"] = instructions
+
+    payload_json = json.dumps(payload)
+
+    curl_cmd = [
+        "curl", "-s", "-N", "-X", "POST", server_url,
+        "-H", "Content-Type: application/json",
+        "-d", payload_json,
+    ]
+
+    if response_format == "wav":
+        if _find_ffplay():
+            print("--- Playing WAV via ffplay ---", file=sys.stderr)
+            curl_process = subprocess.Popen(curl_cmd, stdout=subprocess.PIPE)
+            ffplay_cmd = ["ffplay", "-nodisp", "-autoexit", "-"]
+            ffplay_process = subprocess.Popen(ffplay_cmd, stdin=curl_process.stdout)
+            curl_process.stdout.close()
+            ffplay_process.wait()
+            curl_process.wait()
+        elif _find_aplay():
+            print("ffplay not found, falling back to PCM via aplay...", file=sys.stderr)
+            pcm_payload = payload.copy()
+            pcm_payload["response_format"] = "pcm"
+            pcm_json = json.dumps(pcm_payload)
+            curl_cmd[-1] = pcm_json
+            curl_process = subprocess.Popen(curl_cmd, stdout=subprocess.PIPE)
+            aplay_cmd = ["aplay", "-f", "S16_LE", "-r", "24000", "-c", "1"]
+            aplay_process = subprocess.Popen(aplay_cmd, stdin=curl_process.stdout)
+            curl_process.stdout.close()
+            aplay_process.wait()
+            curl_process.wait()
+        else:
+            print(
+                "No audio player found. Install ffplay (ffmpeg) or aplay (alsa-utils).",
+                file=sys.stderr,
+            )
+            return
+    elif response_format == "pcm":
+        if _find_aplay():
+            print("--- Playing PCM via aplay ---", file=sys.stderr)
+            curl_process = subprocess.Popen(curl_cmd, stdout=subprocess.PIPE)
+            aplay_cmd = ["aplay", "-f", "S16_LE", "-r", "24000", "-c", "1"]
+            aplay_process = subprocess.Popen(aplay_cmd, stdin=curl_process.stdout)
+            curl_process.stdout.close()
+            aplay_process.wait()
+            curl_process.wait()
+        else:
+            print("aplay not found. Install alsa-utils.", file=sys.stderr)
+            return
+
+
+def _find_ffplay() -> bool:
+    try:
+        subprocess.run(["ffplay", "-version"], capture_output=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+
+def _find_aplay() -> bool:
+    try:
+        subprocess.run(["aplay", "--version"], capture_output=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
 
 
 # ── Logger ────────────────────────────────────────────────────────────
@@ -198,21 +297,32 @@ def log_exchange(log_path: Path, exchange_num: int, user_text: str, assistant_te
 
 # ── Main Loop ─────────────────────────────────────────────────────────
 
-BANNER = "say-chat v0.1.0 -- Voice chat with LLM via tscribe + litellm"
+BANNER = "say-chat-streaming v0.1.0 -- Voice chat with LLM via tscribe + litellm + Qwen3-TTS"
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Voice chat with LLM via tscribe + litellm")
-    parser.add_argument("--voice", help="TTS voice for say (default: Samantha)")
-    parser.add_argument("--rate", type=str, help="Speech rate in words per minute")
+    parser = argparse.ArgumentParser(
+        description="Voice chat with LLM via tscribe + litellm + Qwen3-TTS streaming"
+    )
+    parser.add_argument(
+        "--model",
+        choices=["custom-voice", "voice-design", "voice-clone"],
+        default="voice-clone",
+        help="TTS model to use (default: voice-clone)",
+    )
     args, _ = parser.parse_known_args()
 
     config = load_config()
 
-    if args.voice:
-        config["say_voice"] = args.voice
-    if args.rate:
-        config["say_rate"] = args.rate
+    model_config = get_model_config(args.model)
+    tts_model_name = model_config["model_name"]
+    tts_voice = model_config["voice"]
+    tts_instructions = model_config["instructions"]
+
+    if config["tts_voice"] != "danial":
+        tts_voice = config["tts_voice"]
+    if config["tts_instructions"]:
+        tts_instructions = config["tts_instructions"]
 
     log_dir = Path.cwd() / "logs"
 
@@ -241,11 +351,14 @@ def main():
     )
 
     print(BANNER)
+    print(f"TTS Model: {args.model} ({tts_model_name})")
+    print(f"TTS Voice: {tts_voice}")
+    print(f"TTS Server: {config['tts_server_url']}")
     exchange_num = 0
 
     log_dir.mkdir(parents=True, exist_ok=True)
     prune_logs(log_dir, max_files=100)
-    session_log = log_dir / f"{datetime.now():%Y-%m-%d_%H-%M-%S}.log"
+    session_log = log_dir / f"{datetime.now():%Y-%m-%d_%H-%M-%S}_streaming.log"
 
     try:
         while True:
@@ -286,9 +399,17 @@ def main():
             print(f"\n[Assistant] {assistant_text}", flush=True)
 
             try:
-                speak(assistant_text, voice=config["say_voice"], rate=config["say_rate"])
+                speak_streaming(
+                    assistant_text,
+                    server_url=config["tts_server_url"],
+                    model_name=tts_model_name,
+                    voice=tts_voice,
+                    instructions=tts_instructions,
+                )
             except subprocess.CalledProcessError as e:
-                print(f"\n[Error] say command failed: {e}", file=sys.stderr)
+                print(f"\n[Error] TTS streaming failed: {e}", file=sys.stderr)
+            except Exception as e:
+                print(f"\n[Error] TTS error: {e}", file=sys.stderr)
 
             log_exchange(session_log, exchange_num, user_text, assistant_text)
 

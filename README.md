@@ -10,12 +10,14 @@ Record your microphone, get transcribed by [tscribe](https://github.com/danielra
 
 - **Python 3.10+**
 - **ffmpeg** (`brew install ffmpeg`)
-- **tscribe** installed globally:
+- **tscribe** installed globally (with remote transcription support):
   ```bash
   cd ~/repos/tscribe-transcription-tool
+  uv sync
   uv tool install .
   ```
-  Verify: `tscribe --version`
+  Verify: `tscribe --help`
+- **ffplay** (from ffmpeg) or **aplay** (for streaming TTS playback)
 
 ---
 
@@ -33,6 +35,7 @@ LITELLM_API_KEY=sk-...
 LITELLM_BASE_URL=http://100.89.168.11:6280/v1
 LITELLM_MODEL=chat
 TSCRIBE_DEVICE_ID=17
+TRANSCRIPTION_MODEL=Systran/faster-distil-whisper-large-v3
 ```
 
 Find your microphone device ID with:
@@ -40,6 +43,8 @@ Find your microphone device ID with:
 ```bash
 tscribe devices
 ```
+
+**Note:** Transcription uses `tscribe` which now supports remote transcription via the LiteLLM API. Configure `TRANSCRIPTION_MODEL` to use the remote API, or omit it to use local Whisper.
 
 Optional TTS settings (omit to use your system default):
 
@@ -52,11 +57,24 @@ Optional TTS settings (omit to use your system default):
 
 ## Usage
 
+### Basic Voice Chat (macOS say)
+
 ```bash
 uv run voice-chat
 # Or with a specific voice/rate:
 uv run voice-chat --voice Samantha --rate 180
 ```
+
+### Streaming Voice Chat (Qwen3-TTS)
+
+```bash
+uv run voice-chat-streaming
+# Or with a specific TTS model:
+uv run voice-chat-streaming --model custom-voice
+uv run voice-chat-streaming --model voice-design
+```
+
+Requires `ffplay` (from ffmpeg) or `aplay` (from alsa-utils) for audio playback.
 
 CLI flags:
 
@@ -96,6 +114,7 @@ Press Enter to record (or 'q' to quit)...
 
 ## How It Works
 
+**Basic voice-chat:**
 ```
  ┌──────────┐    ┌───────────┐    ┌──────────┐    ┌──────────┐
  │ tscribe  │───▶│ ChatClient│───▶│   say    │───▶│ Speaker  │
@@ -103,15 +122,25 @@ Press Enter to record (or 'q' to quit)...
  └──────────┘    └───────────┘    └──────────┘    └──────────┘
 ```
 
+**Streaming voice-chat-streaming:**
+```
+ ┌──────────┐    ┌───────────┐    ┌──────────────┐    ┌──────────┐
+ │ tscribe  │───▶│ ChatClient│───▶│ Qwen3-TTS    │───▶│ ffplay/  │
+ │ record   │    │ (litellm) │    │ Server (curl) │    │ aplay    │
+ └──────────┘    └───────────┘    └──────────────┘    └──────────┘
+```
+
 1. **Record** -- wraps `tscribe record --device-id N` as a subprocess.
-   Press Enter to start, Enter again to stop (sends SIGINT to tscribe).
+    Press Enter to start, Enter again to stop (sends SIGINT to tscribe).
 2. **Transcribe** -- handled by tscribe (Whisper via faster-whisper).
-   Output is parsed to extract raw transcript text.
+    Output is parsed to extract raw transcript text.
 3. **Chat** -- transcript + conversation history sent to the litellm
-   API via direct HTTP POST. Multi-turn context is maintained.
-4. **Speak** -- LLM response piped to macOS `say` for TTS playback.
+    API via direct HTTP POST. Multi-turn context is maintained.
+4. **Speak** -- LLM response sent to Qwen3-TTS server with `stream: true`.
+    Audio is piped directly to `ffplay` (or `aplay` as fallback) for
+    real-time playback.
 5. **Log** -- every exchange is appended to a timestamped file in
-   `logs/`. Only the 100 most recent log files are retained.
+    `logs/`. Only the 100 most recent log files are retained.
 
 ---
 
@@ -141,7 +170,8 @@ say-chat/
 └── src/
     └── say_chat/
         ├── __init__.py
-        └── cli.py        # Entry: `voice-chat`
+        ├── cli.py        # Entry: `voice-chat`
+        └── streaming_cli.py  # Entry: `voice-chat-streaming`
 ```
 
 ## Configuration
@@ -152,7 +182,14 @@ say-chat/
 | `LITELLM_BASE_URL` | No | `http://100.89.168.11:6280/v1` | API base URL |
 | `LITELLM_MODEL` | No | `chat` | Model name |
 | `TSCRIBE_DEVICE_ID` | No | `17` | Audio input device |
+| `TRANSCRIPTION_MODEL` | No | -- | Remote transcription model (uses LITELLM credentials) |
+| `MAX_RETRIES` | No | `3` | Max retries on rate limit (429) |
+| `BACKOFF_FACTOR` | No | `1.0` | Exponential backoff factor in seconds |
 | `SAY_VOICE` | No | `Samantha` | TTS voice (or set via `--voice`) |
 | `SAY_RATE` | No | system default | Speech rate (or set via `--rate`) |
+| `TTS_SERVER_URL` | No | `http://100.125.210.60:8001/v1/audio/speech` | Qwen3-TTS server URL |
+| `TTS_MODEL` | No | `qwen3-tts-voice-clone` | TTS model name |
+| `TTS_VOICE` | No | `danial` | Voice for TTS |
+| `TTS_INSTRUCTIONS` | No | -- | Instructions for TTS |
 
 Precedence (highest to lowest): CLI flags -> `.env` file -> code defaults.

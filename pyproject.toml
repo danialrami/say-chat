@@ -15,6 +15,7 @@ Homepage = "https://github.com/danielramirez/say-chat"
 
 [project.scripts]
 voice-chat = "say_chat.cli:main"
+voice-chat-streaming = "say_chat.streaming_cli:main"
 
 [build-system]
 requires = ["hatchling"]
